@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+*.spec
+
+# Test/lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+*.code-workspace
+
+# Local secrets, if anyone ever adds one
+.env

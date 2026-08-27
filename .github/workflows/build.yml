@@ -1,0 +1,129 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  commit-lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install commitizen
+      - name: Check every commit message in this PR follows Conventional Commits
+        run: |
+          cz check --rev-range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test,dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
+
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Freeze resolved dependency versions
+        run: |
+          mkdir audit
+          pip freeze > audit/requirements.txt
+      - name: Scan dependencies for known vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: audit
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # Artifacts only ever get consumed by the release job below, which only
+  # runs on tag pushes — so skip the (slow, three-OS) build except when a
+  # release is actually being cut, or on a manual run to test packaging.
+  build:
+    needs: [test, security-audit]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[build]"
+
+      - name: Build AppImage
+        if: runner.os == 'Linux'
+        run: ./packaging/appimage/build.sh
+
+      - name: Smoke test AppImage
+        if: runner.os == 'Linux'
+        run: |
+          QT_QPA_PLATFORM=offscreen APPIMAGE_EXTRACT_AND_RUN=1 \
+            ./dist/spotify-tidal-migrator-x86_64.AppImage &
+          pid=$!
+          sleep 3
+          kill -0 "$pid"  # fails the step if it already exited
+          kill "$pid"
+
+      - name: Build (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: pyinstaller --noconfirm --clean --name spotify-tidal-migrator --windowed pyinstaller_entry.py
+
+      # Linux ships just the AppImage; the onedir folder build.sh also
+      # produces alongside it is an intermediate, not a distributable.
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: spotify-tidal-migrator-${{ matrix.os }}
+          path: dist/spotify-tidal-migrator-x86_64.AppImage
+
+      # onedir output on Windows is dist/spotify-tidal-migrator/, on macOS
+      # --windowed produces dist/spotify-tidal-migrator.app instead — the
+      # glob covers both.
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'Linux'
+        with:
+          name: spotify-tidal-migrator-${{ matrix.os }}
+          path: dist/spotify-tidal-migrator*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Zip each platform build
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$name" && zip -r "../${name}.zip" .)
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
